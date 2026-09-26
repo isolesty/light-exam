@@ -1,0 +1,5 @@
+.lpk-content/
+runtime/
+release/*.lpk
+!release/.gitkeep
+node_modules/

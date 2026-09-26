@@ -1,0 +1,100 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createSign, generateKeyPairSync } from 'node:crypto';
+
+const listen = server => new Promise(resolve=>server.listen(0,'127.0.0.1',()=>resolve(`http://127.0.0.1:${server.address().port}`)));
+const close = server => new Promise(resolve=>server.close(resolve));
+const freePort = async () => { const s=http.createServer(); const origin=await listen(s); await close(s); return origin; };
+
+test('本地账号、OIDC 管理员映射、用户管理与考试隔离',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'light-exam-http-'));
+  const {privateKey,publicKey}=generateKeyPairSync('rsa',{modulusLength:2048});
+  const jwk=publicKey.export({format:'jwk'});jwk.kid='test-key';jwk.use='sig';
+  let issuer='',nonce='',identity={sub:'admin-1',name:'管理员',groups:['ADMIN']};
+  const provider=http.createServer(async(req,res)=>{
+    const url=new URL(req.url,issuer||'http://127.0.0.1');
+    const send=value=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify(value))};
+    if(url.pathname==='/.well-known/openid-configuration')return send({issuer,jwks_uri:`${issuer}/keys`});
+    if(url.pathname==='/keys')return send({keys:[jwk]});
+    if(url.pathname==='/token'){
+      const enc=o=>Buffer.from(JSON.stringify(o)).toString('base64url');
+      const header=enc({alg:'RS256',kid:jwk.kid}),payload=enc({iss:issuer,sub:identity.sub,aud:'light-exam-test',nonce,iat:Math.floor(Date.now()/1000),exp:Math.floor(Date.now()/1000)+600});
+      const signer=createSign('RSA-SHA256');signer.update(`${header}.${payload}`);signer.end();
+      return send({id_token:`${header}.${payload}.${signer.sign(privateKey).toString('base64url')}`,access_token:'test-access'});
+    }
+    if(url.pathname==='/userinfo')return send({...identity});
+    res.writeHead(404).end();
+  });
+  let app;
+  try{
+    issuer=await listen(provider);
+    const origin=await freePort();
+    Object.assign(process.env,{NODE_ENV:'test',DATA_DIR:dir,APP_ORIGIN:origin,OIDC_CLIENT_ID:'light-exam-test',OIDC_CLIENT_SECRET:'test-secret',OIDC_ISSUER:issuer,OIDC_AUTH_URI:`${issuer}/auth`,OIDC_TOKEN_URI:`${issuer}/token`,OIDC_USERINFO_URI:`${issuer}/userinfo`});
+    ({server:app}=await import('./server.mjs'));
+    await new Promise(resolve=>app.listen(Number(new URL(origin).port),'127.0.0.1',resolve));
+    const login=async(expectedStatus=303)=>{
+      const start=await fetch(origin+'/auth/login',{redirect:'manual'});
+      assert.equal(start.status,303);
+      const stateCookie=start.headers.get('set-cookie').split(';')[0];
+      const authUrl=new URL(start.headers.get('location'));nonce=authUrl.searchParams.get('nonce');
+      const callback=new URL('/auth/oidc/callback',origin);callback.searchParams.set('state',authUrl.searchParams.get('state'));callback.searchParams.set('code','test-code');
+      const done=await fetch(callback,{headers:{Cookie:stateCookie},redirect:'manual'});
+      assert.equal(done.status,expectedStatus);
+      return expectedStatus===303?done.headers.getSetCookie().find(v=>v.startsWith('le_session=')).split(';')[0]:null;
+    };
+    const request=async(cookie,url,method='GET',body)=>{const r=await fetch(origin+url,{method,headers:{Cookie:cookie,...(body===undefined?{}:{Origin:origin,'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body),redirect:'manual'});return{status:r.status,data:await r.json()}};
+    const localLogin=async(username,password)=>{const response=await fetch(origin+'/api/auth/login',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:JSON.stringify({username,password})});return {status:response.status,data:await response.json(),cookie:response.headers.get('set-cookie')?.split(';')[0]}};
+    assert.equal((await fetch(origin+'/login')).status,200);
+    assert.equal((await localLogin('admin','Unconfigured123')).status,401);
+    const admin=await login();
+    assert.equal((await request(admin,'/api/me')).data.mustChangePassword,false);
+    assert.equal((await request(admin,'/api/me/password','PATCH',{newPassword:'weak'})).status,400);
+    assert.equal((await request(admin,'/api/me/password','PATCH',{newPassword:'ChosenLocal785A'})).status,200);
+    const localAdmin=await localLogin('admin','ChosenLocal785A');
+    assert.equal(localAdmin.status,200);
+    assert.equal(localAdmin.data.mustChangePassword,false);
+    assert.equal((await request(admin,'/api/me')).data.sub,'local:admin');
+    assert.equal((await request(admin,'/api/me')).data.mustChangePassword,false);
+    assert.equal((await request(admin,'/api/users','POST',{username:'student1',password:'weak'})).status,400);
+    assert.equal((await request(admin,'/api/users','POST',{username:'student1',password:'Student1234'})).status,201);
+    const created=await request(admin,'/api/banks','POST',{name:'测试题库'});assert.equal(created.status,201);
+    const bankId=created.data.id;
+    const questions=[{number:1,stem:'单选题',options:{A:'甲',B:'乙'},answer:'A',tags:['单选','章节:第一章']},{number:2,stem:'多选题',options:{A:'甲',B:'乙',C:'丙'},answer:'AC',tags:['多选','章节:第二章']}];
+    assert.equal((await request(admin,`/api/banks/${bankId}/questions`,'PUT',{questions})).status,200);
+    const plan=await request(admin,`/api/banks/${bankId}/templates`,'POST',{name:'测试卷',chapters:['第一章'],rules:{单选:{count:1,score:.5},多选:{count:1,score:2},判断:{count:0,score:1}}});assert.equal(plan.status,201);
+    identity={sub:'student-1',name:'考生',groups:[]};
+    const oidcStudent=await login();
+    const oidcMe=await request(oidcStudent,'/api/me');
+    assert.equal(oidcMe.data.name,'考生');
+    assert.equal(oidcMe.data.canManage,false);
+    assert.equal(oidcMe.data.authMethod,'oidc');
+    assert.equal((await request(oidcStudent,'/api/banks','POST',{name:'OIDC 用户不能管理'})).status,403);
+    assert.equal((await request(oidcStudent,'/api/me/password','PATCH',{newPassword:'Another1234'})).status,403);
+    const studentLogin=await localLogin('student1','Student1234');assert.equal(studentLogin.status,200);assert.equal(studentLogin.data.mustChangePassword,true);
+    const student=studentLogin.cookie;
+    assert.equal((await request(student,'/api/attempts')).status,403);
+    assert.equal((await request(student,'/api/me/password','PATCH',{currentPassword:'Student1234',newPassword:'Student5678'})).status,200);
+    assert.equal((await request(student,'/api/me')).data.canManage,false);
+    assert.equal((await request(student,'/api/banks','POST',{name:'非法题库'})).status,403);
+    const started=await request(student,'/api/attempts','POST',{mode:'exam',bankId,templateId:plan.data.id});assert.equal(started.status,201);
+    assert.equal(started.data.questions.length,2);assert.ok(started.data.questions.every(q=>!Object.hasOwn(q,'answer')));
+    const single=started.data.questions.find(q=>q.type==='单选'),multiple=started.data.questions.find(q=>q.type==='多选');
+    assert.equal(multiple.chapter,'第二章');
+    assert.equal((await request(student,`/api/attempts/${started.data.id}/progress`,'PATCH',{questionId:single.id,answer:'A',position:0})).status,200);
+    assert.equal((await request(student,`/api/attempts/${started.data.id}/progress`,'PATCH',{questionId:multiple.id,answer:'AB',position:1})).status,200);
+    const result=await request(student,`/api/attempts/${started.data.id}/submit`,'POST',{});
+    assert.equal(result.data.stats.score,.5);assert.equal(result.data.stats.maxScore,2.5);
+    assert.equal(result.data.questions.find(q=>q.id===multiple.id).answer,'AC');
+    assert.equal((await request(admin,`/api/attempts/${started.data.id}`)).status,404);
+    assert.equal((await request(admin,'/api/users/student1/password','PUT',{password:'Reset9876A'})).status,200);
+    assert.equal((await request(student,'/api/me')).status,401);
+    const resetLogin=await localLogin('student1','Reset9876A');assert.equal(resetLogin.status,200);
+    assert.equal((await request(admin,'/api/users/student1','PATCH',{active:false})).status,200);
+    assert.equal((await request(resetLogin.cookie,'/api/me')).status,401);
+    assert.equal((await localLogin('student1','Reset9876A')).status,401);
+  }finally{if(app)await close(app);await close(provider);fs.rmSync(dir,{recursive:true,force:true})}
+});

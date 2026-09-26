@@ -1,0 +1,13 @@
+package: cloud.lazycat.app.lightexam
+version: 1.0.4
+name: 轻量考试
+description: 支持共享题库、章节练习、随机组卷、答题卡与错题本的考试应用
+locales:
+  zh-CN:
+    name: 轻量考试
+    description: 共享题库、章节练习与随机考试
+    usage: 懒猫管理员首次通过 OIDC 登录，然后创建题库并导入 CSV、XLSX 或 JSON 题目，再设置考试方案；其他用户可使用懒猫账号免密登录或使用管理员分配的本地账号。
+  en-US:
+    name: Light Exam
+    description: Shared question banks, chapter practice and configurable exams
+    usage: Lazycat admins first sign in with OIDC, then create a question bank, import CSV, XLSX or JSON questions, and set exam plans. Others can sign in with their Lazycat account or a local account created by an admin.

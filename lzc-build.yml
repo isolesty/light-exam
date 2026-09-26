@@ -1,0 +1,5 @@
+buildscript: ./prepare-lpk.sh
+manifest: ./lzc-manifest.yml
+contentdir: ./.lpk-content
+pkgout: ./release
+icon: ./lpk/icon.png

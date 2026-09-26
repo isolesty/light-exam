@@ -1,0 +1,20 @@
+usage: 管理员先创建题库、导入题目并设置考试方案；懒猫账号可免密登录，本地账号由管理员创建。
+application:
+  image: node:22-alpine
+  subdomain: light-exam
+  oidc_redirect_path: /auth/oidc/callback
+  public_path:
+    - /
+  workdir: /lzcapp/pkg/content
+  environment:
+    PORT: "8080"
+    DATA_DIR: /lzcapp/var
+    APP_ORIGIN: https://${LAZYCAT_APP_DOMAIN}
+    OIDC_CLIENT_ID: ${LAZYCAT_AUTH_OIDC_CLIENT_ID}
+    OIDC_CLIENT_SECRET: ${LAZYCAT_AUTH_OIDC_CLIENT_SECRET}
+    OIDC_ISSUER: ${LAZYCAT_AUTH_OIDC_ISSUER_URI}
+    OIDC_AUTH_URI: ${LAZYCAT_AUTH_OIDC_AUTH_URI}
+    OIDC_TOKEN_URI: ${LAZYCAT_AUTH_OIDC_TOKEN_URI}
+    OIDC_USERINFO_URI: ${LAZYCAT_AUTH_OIDC_USERINFO_URI}
+  routes:
+    - /=exec://8080,/lzcapp/pkg/content/run.sh
