@@ -1,5 +1,5 @@
 package: cloud.lazycat.app.lightexam
-version: 1.0.16
+version: 1.0.17
 name: 轻量考试
 description: 支持共享题库、章节练习、随机组卷、答题卡与错题本的考试应用
 locales:

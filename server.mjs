@@ -276,6 +276,14 @@ async function api(req, res, url, user) {
   if (p === '/api/attempts' && req.method === 'GET') return send(res,200,db.prepare('SELECT id,bank_id AS bankId,mode,title,score,max_score AS maxScore,created_at AS createdAt,submitted_at AS submittedAt FROM attempts WHERE user_sub=? ORDER BY created_at DESC LIMIT 50').all(user.sub));
   const attemptMatch=p.match(/^\/api\/attempts\/([^/]+)$/);
   if (attemptMatch && req.method === 'GET') return send(res,200,presentAttempt(attemptRow(attemptMatch[1],user.sub)));
+  if (attemptMatch && req.method === 'DELETE') {
+    const row=attemptRow(attemptMatch[1],user.sub);
+    if (row.submitted_at) throw fail(409,'已交卷的答题记录不能删除');
+    const result=db.prepare('DELETE FROM attempts WHERE id=? AND user_sub=? AND submitted_at IS NULL').run(row.id,user.sub);
+    if (!result.changes) throw fail(409,'答题状态已改变，请刷新后重试');
+    return send(res,200,{ok:true});
+  }
+
   const progressMatch=p.match(/^\/api\/attempts\/([^/]+)\/progress$/);
   if (progressMatch && req.method === 'PATCH') { const row=attemptRow(progressMatch[1],user.sub); if(row.submitted_at) throw fail(409,'已交卷'); const a=mappedAttempt(row), body=await getBody(req); const q=a.questions.find(q=>q.id===body.questionId); if(!q) throw fail(400,'题目不属于本次答题'); if(a.confirmed[q.id] && (body.marked===undefined || normalizeAnswer(body.answer)!==a.answers[q.id])) throw fail(409,'本题已确认'); const answer=normalizeAnswer(body.answer); validateChoice(q,answer); if(!a.confirmed[q.id]) a.answers[q.id]=answer; if(body.position!==undefined) { if(!Number.isInteger(body.position)||body.position<0||body.position>=a.questions.length) throw fail(400,'题号无效'); a.position=body.position; } if(body.marked!==undefined) a.marks[q.id]=!!body.marked; db.prepare('UPDATE attempts SET answers_json=?,marks_json=?,position=? WHERE id=?').run(json(a.answers),json(a.marks),a.position,a.id); return send(res,200,{ok:true}); }
   const positionMatch=p.match(/^\/api\/attempts\/([^/]+)\/position$/);

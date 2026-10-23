@@ -591,3 +591,6 @@ button:disabled { box-shadow: none; transform: none; }
 .question-list-row p{margin:7px 0;white-space:pre-wrap;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .question-pagination{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:14px}
 @media(max-width:600px){.question-filters,.question-options{grid-template-columns:1fr}.question-list-row{align-items:flex-start}}
+
+.resume-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
+@media(max-width:480px){.resume-attempt{flex-wrap:wrap}.resume-actions{width:100%;justify-content:flex-end}}
