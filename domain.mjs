@@ -69,6 +69,22 @@ export function shuffle(input) {
   return values;
 }
 
+// Randomize only at snapshot creation; resuming an attempt reuses its stored order.
+export function shuffleMultipleOptions(question, randomize = shuffle) {
+  if (question.type !== '多选') return {...question};
+  const original = Object.entries(question.options).sort(([a],[b])=>a.localeCompare(b));
+  const ordered = randomize(original);
+  const letters = 'ABCDEFGH';
+  const mapping = Object.fromEntries(ordered.map(([oldLetter],i)=>[oldLetter,letters[i]]));
+  const options = Object.fromEntries(ordered.map(([,label],i)=>[letters[i],label]));
+  const answer = normalizeAnswer([...question.answer].map(letter=>mapping[letter]).join(''));
+  // Preserve prose verbatim: replacing letters in free text could corrupt formulas.
+  const changed = original.some(([letter])=>mapping[letter]!==letter);
+  const references = /[A-H]/i.test(question.explanation || '');
+  const note = changed && references ? `选项已随机排列。原解析标号对应本题：${original.map(([letter])=>`${letter}→${mapping[letter]}`).join('，')}。\n\n` : '';
+  return {...question, options, answer, explanation:note+(question.explanation || '')};
+}
+
 // Ignore import numbering, chapter labels and layout-only whitespace when comparing
 // content. Sort option text so a reordered copy cannot appear twice in one paper.
 const contentText = value => text(value).normalize('NFKC').replace(/\s+/gu, '');
@@ -98,7 +114,7 @@ export function buildExam(questions, template) {
     if (unique.length < count) throw new Error(`${type}题不足：需要 ${count} 道，去重后全库只有 ${unique.length} 道（原始 ${byType.length} 道）`);
     selected.push(...unique.slice(0, count));
   }
-  return selected.map(q => ({ ...q, score: template.rules[q.type].score }));
+  return selected.map(q => ({ ...shuffleMultipleOptions(q), score: template.rules[q.type].score }));
 }
 
 export function grade(snapshot, answers) {

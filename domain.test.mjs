@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { normalizeQuestions, normalizeTemplate, buildExam, grade, summarize } from './domain.mjs';
+import { normalizeQuestions, normalizeTemplate, buildExam, grade, summarize, shuffleMultipleOptions } from './domain.mjs';
 import { openStore, transaction } from './store.mjs';
 
 const bank='bank-1';
@@ -75,4 +75,31 @@ test('同卷按内容去重，忽略题号、章节、空白、选项顺序和�
     assert.equal(exam.filter(q=>q.type==='多选').length,1);
     assert.equal(exam.filter(q=>q.type==='判断').length,1);
   }
+});
+
+
+test('多选选项重排同步答案，保留原题与解析，单选和判断顺序不变',()=>{
+  const original={id:'multi',type:'多选',options:{A:'甲',B:'乙',C:'丙',D:'丁',E:'戊'},answer:'ACE',explanation:'A、C、E 正确，公式 A = B + C。',score:1.5};
+  const before=structuredClone(original);
+  const reversed=shuffleMultipleOptions(original,entries=>[...entries].reverse());
+  assert.deepEqual(reversed.options,{A:'戊',B:'丁',C:'丙',D:'乙',E:'甲'});
+  assert.equal(reversed.answer,'ACE');
+  assert.ok(reversed.explanation.endsWith(original.explanation));
+  assert.match(reversed.explanation,/A→E，B→D，C→C，D→B，E→A/);
+  const moved=shuffleMultipleOptions({...original,answer:'AB'},entries=>[...entries].reverse());
+  assert.equal(moved.answer,'DE');
+  assert.deepEqual(grade([moved],{multi:'DE'}),{score:1.5,maxScore:1.5,correct:1,blank:0,incorrect:0});
+  assert.equal(grade([moved],{multi:'AB'}).score,0);
+  const orders=new Set();
+  for(let i=0;i<100;i++){
+    const q=shuffleMultipleOptions(original);orders.add(JSON.stringify(q.options));
+    assert.deepEqual([...q.answer].map(c=>q.options[c]).sort(),['丙','戊','甲'].sort());
+    assert.deepEqual(Object.values(q.options).sort(),Object.values(original.options).sort());
+    assert.deepEqual(Object.keys(q.options),['A','B','C','D','E']);
+  }
+  assert.ok(orders.size>1);
+  assert.deepEqual(original,before);
+  for(const type of ['单选','判断'])assert.deepEqual(shuffleMultipleOptions({...original,type}),{...original,type});
+  const sparse=shuffleMultipleOptions({...original,options:{B:'乙',D:'丁',H:'辛'},answer:'BH',explanation:''},entries=>[...entries].reverse());
+  assert.deepEqual(sparse.options,{A:'辛',B:'丁',C:'乙'});assert.equal(sparse.answer,'AC');
 });
