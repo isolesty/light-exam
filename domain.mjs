@@ -70,8 +70,7 @@ export function shuffle(input) {
 }
 
 // Randomize only at snapshot creation; resuming an attempt reuses its stored order.
-export function shuffleMultipleOptions(question, randomize = shuffle) {
-  if (question.type !== '多选') return {...question};
+export function shuffleQuestionOptions(question, randomize = shuffle) {
   const original = Object.entries(question.options).sort(([a],[b])=>a.localeCompare(b));
   const ordered = randomize(original);
   const letters = 'ABCDEFGH';
@@ -114,7 +113,7 @@ export function buildExam(questions, template) {
     if (unique.length < count) throw new Error(`${type}题不足：需要 ${count} 道，去重后全库只有 ${unique.length} 道（原始 ${byType.length} 道）`);
     selected.push(...unique.slice(0, count));
   }
-  return selected.map(q => ({ ...shuffleMultipleOptions(q), score: template.rules[q.type].score }));
+  return selected.map(q => ({ ...shuffleQuestionOptions(q), score: template.rules[q.type].score }));
 }
 
 export function grade(snapshot, answers) {

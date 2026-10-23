@@ -137,10 +137,11 @@ test('本地账号、OIDC 管理员映射、用户管理与考试隔离',async()
     assert.equal(started.data.questions.length,2);assert.ok(started.data.questions.every(q=>!Object.hasOwn(q,'answer')));
     const single=started.data.questions.find(q=>q.type==='单选'),multiple=started.data.questions.find(q=>q.type==='多选');
     assert.equal(multiple.chapter,'第二章');
+    const singleExpected=Object.entries(single.options).find(([,label])=>label==='甲')[0];
     const multipleExpected=Object.entries(multiple.options).filter(([,label])=>['甲','丙'].includes(label)).map(([letter])=>letter).sort().join('');
     const multipleWrong=Object.entries(multiple.options).filter(([,label])=>['甲','乙'].includes(label)).map(([letter])=>letter).sort().join('');
     assert.deepEqual((await request(student,`/api/attempts/${started.data.id}`)).data.questions,started.data.questions);
-    assert.equal((await request(student,`/api/attempts/${started.data.id}/progress`,'PATCH',{questionId:single.id,answer:'A',position:0})).status,200);
+    assert.equal((await request(student,`/api/attempts/${started.data.id}/progress`,'PATCH',{questionId:single.id,answer:singleExpected,position:0})).status,200);
     assert.equal((await request(student,`/api/attempts/${started.data.id}/progress`,'PATCH',{questionId:multiple.id,answer:multipleWrong,position:1})).status,200);
     const result=await request(student,`/api/attempts/${started.data.id}/submit`,'POST',{});
     assert.deepEqual((await request(student,'/api/attempts?unfinished=1')).data,[]);
@@ -171,11 +172,11 @@ test('本地账号、OIDC 管理员映射、用户管理与考试隔离',async()
     assert.equal((await request(admin,editUrl,'PUT',{question:corrected,revision:edit.data.revision})).status,409);
     assert.deepEqual((await request(student,`/api/learning?bankId=${bankId}`)).data.items,learningBefore);
     const oldSnapshot=(await request(student,`/api/attempts/${started.data.id}`)).data.questions.find(q=>q.id===single.id);
-    assert.equal(oldSnapshot.stem,single.stem);assert.equal(oldSnapshot.answer,'A');
+    assert.equal(oldSnapshot.stem,single.stem);assert.equal(oldSnapshot.answer,singleExpected);
     const correctedExam=await request(admin,'/api/attempts','POST',{mode:'exam',bankId,templateId:plan.data.id});assert.equal(correctedExam.status,201);assert.equal(correctedExam.data.questions.find(q=>q.id===single.id).stem,'已纠正的题干');
     const newer=await request(student,'/api/attempts','POST',{mode:'practice',bankId,filters:{ids:[single.id]}});assert.equal(newer.status,201);assert.equal(newer.data.questions[0].stem,'已纠正的题干');
     await request(student,`/api/attempts/${newer.data.id}/progress`,'PATCH',{questionId:single.id,answer:'A',position:0});
-    const confirmed=await request(student,`/api/attempts/${newer.data.id}/confirm`,'POST',{questionId:single.id});assert.equal(confirmed.data.answer,'B');assert.equal(confirmed.data.explanation,'更正后的解析');
+    const confirmed=await request(student,`/api/attempts/${newer.data.id}/confirm`,'POST',{questionId:single.id});assert.equal(confirmed.data.answer,Object.entries(newer.data.questions[0].options).find(([,label])=>label==='乙')[0]);assert.equal(confirmed.data.explanation,'更正后的解析');
     const learningBeforeDelete=(await request(student,`/api/learning?bankId=${bankId}`)).data;
     const deletePath=`/api/attempts/${newer.data.id}`;
     assert.equal((await fetch(origin+deletePath,{method:'DELETE',headers:{Origin:origin,'Content-Type':'application/json'}})).status,401);
@@ -191,6 +192,28 @@ test('本地账号、OIDC 管理员映射、用户管理与考试隔离',async()
     assert.equal((await request(student,`/api/attempts/${multiPractice.data.id}`)).status,200);
     assert.deepEqual((await request(student,`/api/learning?bankId=${bankId}`)).data,learningBeforeDelete);
     assert.equal((await request(admin,`/api/attempts/${correctedExam.data.id}`,'DELETE',{})).status,200);
+    const shuffleBank=(await request(admin,'/api/banks','POST',{name:'三种题型选项重排回归'})).data.id;
+    const originalChoices=[
+      {number:1,type:'单选',stem:'演示单选',options:{A:'正确项',B:'错误项',C:'干扰项'},answer:'A'},
+      {number:2,type:'多选',stem:'演示多选',options:{A:'正确一',B:'错误项',C:'正确二'},answer:'AC'},
+      {number:3,type:'判断',stem:'演示判断',options:{A:'对',B:'错'},answer:'A'},
+    ];
+    await request(admin,`/api/banks/${shuffleBank}/questions`,'PUT',{questions:originalChoices});
+    const shufflePlan=(await request(admin,`/api/banks/${shuffleBank}/templates`,'POST',{name:'三题模拟卷',chapters:'all',rules:{单选:{count:1,score:1},多选:{count:1,score:1},判断:{count:1,score:1}}})).data;
+    for(const mode of ['exam','practice']){
+      const a=(await request(student,'/api/attempts','POST',{mode,bankId:shuffleBank,templateId:shufflePlan.id})).data;
+      assert.equal(a.questions.length,3);assert.ok(a.questions.every(q=>!Object.hasOwn(q,'answer')));
+      for(const q of a.questions){
+        const answer=Object.entries(q.options).filter(([,label])=>['正确项','正确一','正确二','对'].includes(label)).map(([letter])=>letter).sort().join('');
+        await request(student,`/api/attempts/${a.id}/progress`,'PATCH',{questionId:q.id,answer});
+        if(mode==='practice'){const feedback=await request(student,`/api/attempts/${a.id}/confirm`,'POST',{questionId:q.id});assert.equal(feedback.data.correct,true);assert.equal(feedback.data.answer,answer)}
+      }
+      const resumed=(await request(student,`/api/attempts/${a.id}`)).data;
+      assert.deepEqual(resumed.questions.map(q=>q.options),a.questions.map(q=>q.options));
+      assert.equal((await request(student,`/api/attempts/${a.id}/submit`,'POST',{})).data.stats.score,3);
+    }
+    const sourceAfter=(await request(admin,`/api/banks/${shuffleBank}/questions`)).data;
+    assert.deepEqual(sourceAfter.map(q=>({options:q.options,answer:q.answer})),originalChoices.map(q=>({options:q.options,answer:q.answer})));
     assert.equal((await request(admin,'/api/users/student1/password','PUT',{password:'Reset9876A'})).status,200);
     assert.equal((await request(student,'/api/me')).status,401);
     const resetLogin=await localLogin('student1','Reset9876A');assert.equal(resetLogin.status,200);
