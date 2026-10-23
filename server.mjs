@@ -4,7 +4,7 @@ import path from 'node:path';
 import { createHash, createPublicKey, randomBytes, verify as verifySignature } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openStore, transaction, json, parse } from './store.mjs';
-import { TYPES, normalizeAnswer, normalizeQuestions, normalizeTemplate, summarize, buildExam, grade, publicQuestion, shuffle, newId } from './domain.mjs';
+import { TYPES, normalizeAnswer, normalizeQuestion, normalizeQuestions, normalizeTemplate, summarize, buildExam, grade, publicQuestion, shuffle, newId } from './domain.mjs';
 import { ADMIN_SUB, passwordHash, verifyPassword, validatePassword, validateUsername } from './auth.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -19,6 +19,17 @@ const oidc = {
   userinfo: process.env.LAZYCAT_AUTH_OIDC_USERINFO_URI || process.env.OIDC_USERINFO_URI,
 };
 const appOrigin = process.env.APP_ORIGIN || (process.env.LAZYCAT_APP_DOMAIN ? `https://${process.env.LAZYCAT_APP_DOMAIN}` : 'http://localhost:8080');
+// Explicit browser origins only; never infer trust from request or proxy headers.
+const normalizeOrigin = value => {try{const url=new URL(value);return ['http:','https:'].includes(url.protocol)&&!url.hostname.includes('*')&&!url.username&&!url.password&&url.pathname==='/'&&!url.search&&!url.hash?url.origin:null}catch{return null}};
+const defaultOrigin=normalizeOrigin(appOrigin);
+const originSettingKey='allowed_origins';
+if(!db.prepare('SELECT value FROM meta WHERE key=?').get(originSettingKey)){
+ const initial=[...new Set((process.env.ALLOWED_ORIGINS||'').split(/[\s,]+/).map(normalizeOrigin).filter(origin=>origin&&origin!==defaultOrigin))];
+ db.prepare('INSERT INTO meta(key,value) VALUES(?,?)').run(originSettingKey,JSON.stringify(initial));
+}
+const additionalOrigins=()=>JSON.parse(db.prepare('SELECT value FROM meta WHERE key=?').get(originSettingKey).value);
+const originIsAllowed=origin=>!!origin&&(origin===defaultOrigin||additionalOrigins().includes(origin));
+
 const callbackUrl = `${appOrigin}/auth/oidc/callback`;
 const b64 = bytes => Buffer.from(bytes).toString('base64url');
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -58,7 +69,7 @@ const needAdmin = user => { needUser(user); if (!user.admin) throw fail(403, '�
 const verifyOrigin = req => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
   const origin = req.headers.origin;
-  if (!origin || origin !== appOrigin) throw fail(403, '请求来源无效');
+  if (!origin || !originIsAllowed(normalizeOrigin(origin))) throw fail(403, '请求来源无效');
   if (!req.headers['content-type']?.startsWith('application/json') && req.url !== '/auth/logout') throw fail(415, '需要 JSON 请求');
 };
 const mappedAttempt = row => ({ id: row.id, bankId: row.bank_id, templateId: row.template_id, mode: row.mode, title: row.title, questions: readJson(row.snapshot_json), answers: readJson(row.answers_json), marks: readJson(row.marks_json), confirmed: readJson(row.confirmed_json), position: row.position, submittedAt: row.submitted_at, score: row.score, maxScore: row.max_score, createdAt: row.created_at });
@@ -157,6 +168,18 @@ async function api(req, res, url, user) {
     return send(res, 200, { name: account.username, mustChangePassword: !!account.must_change }, { 'Set-Cookie': cookie('le_session', token, 43200) });
   }
   needUser(user);
+  if(p==='/api/settings/access'){
+    needAdmin(user);
+    if(req.method==='GET')return send(res,200,{defaultOrigin,origins:additionalOrigins()});
+    if(req.method==='PUT'){
+      const body=await getBody(req);
+      if(!Array.isArray(body.origins)||body.origins.length>20||body.origins.some(value=>typeof value!=='string'||!normalizeOrigin(value.trim())))throw fail(400,'最多配置 20 个完整的 HTTP/HTTPS 地址，不能含路径、账号、查询参数或通配符');
+      const origins=[...new Set(body.origins.map(value=>normalizeOrigin(value.trim())))].filter(origin=>origin!==defaultOrigin);
+      db.prepare('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(originSettingKey,JSON.stringify(origins));
+      return send(res,200,{defaultOrigin,origins});
+    }
+    throw fail(405,'请求方法不支持');
+  }
   if (p === '/api/me' && req.method === 'GET') return send(res, 200, { sub: user.sub, name: user.name, canManage: user.admin, mustChangePassword: user.mustChangePassword, authMethod: user.authMethod });
   if (p === '/api/me/password' && req.method === 'PATCH') {
     if (user.authMethod === 'oidc' && !user.admin) throw fail(403, '懒猫账号密码请在懒猫微服中修改');
@@ -204,13 +227,43 @@ async function api(req, res, url, user) {
   if (p === '/api/banks' && req.method === 'POST') { needAdmin(user); const body = await getBody(req); const name = String(body.name || '').trim(); if (!name || name.length > 80) throw fail(400, '题库名称须为 1 至 80 个字符'); const id = newId(); db.prepare('INSERT INTO banks(id,name,updated_at) VALUES(?,?,?)').run(id, name, now()); return send(res, 201, { id, name }); }
   const bankMatch = p.match(/^\/api\/banks\/([^/]+)$/);
   if (bankMatch) { const b = bank(bankMatch[1]); if (!b) throw fail(404, '题库不存在'); if (req.method === 'PATCH') { needAdmin(user); const body = await getBody(req); const name = String(body.name || '').trim(); if (!name || name.length > 80) throw fail(400, '题库名称无效'); db.prepare('UPDATE banks SET name=?,updated_at=? WHERE id=?').run(name, now(), b.id); return send(res, 200, { id: b.id, name }); } if (req.method === 'DELETE') { needAdmin(user); db.prepare('UPDATE banks SET active=0 WHERE id=?').run(b.id); db.prepare('UPDATE templates SET active=0 WHERE bank_id=?').run(b.id); return send(res, 200, { ok: true }); } }
+  const editQuestionMatch = p.match(/^\/api\/banks\/([^/]+)\/questions\/([^/]+)$/);
+  if (editQuestionMatch) {
+    needAdmin(user);
+    const b = bank(editQuestionMatch[1]);
+    if (!b) throw fail(404, '题库不存在');
+    const row = db.prepare('SELECT * FROM questions WHERE bank_id=? AND id=?').get(b.id,editQuestionMatch[2]);
+    if (!row) throw fail(404, '题目不存在');
+    if (req.method === 'GET') { const question=rowQuestion(row); return send(res,200,{question,revision:hash(json(question))}); }
+    if (req.method === 'PUT') {
+      const body=await getBody(req);
+      let normalized;
+      try {
+        if (!body.question || !TYPES.includes(body.question.type)) throw Error('请选择有效的题型');
+        normalized=normalizeQuestion(body.question,0,b.id);
+        if (normalized.number.length>80) throw Error('题号不能超过 80 个字符');
+      } catch(error) { throw fail(400,error.message); }
+      const saved=transaction(db,()=>{
+        const current=db.prepare('SELECT * FROM questions WHERE bank_id=? AND id=?').get(b.id,row.id);
+        if (!current) throw fail(404,'题目已被删除或重新导入，请重新加载题库');
+        if (body.revision!==hash(json(rowQuestion(current)))) throw fail(409,'题目已被其他操作修改，请重新打开后再编辑');
+        if (db.prepare('SELECT 1 FROM questions WHERE bank_id=? AND number=? AND stem=? AND id<>?').get(b.id,normalized.number,normalized.stem,row.id)) throw fail(409,'已有相同题号和题干的题目');
+        db.prepare('UPDATE questions SET number=?,type=?,stem=?,options_json=?,answer=?,explanation=?,chapter=?,tags_json=? WHERE id=? AND bank_id=?')
+          .run(normalized.number,normalized.type,normalized.stem,json(normalized.options),normalized.answer,normalized.explanation,normalized.chapter,json(normalized.tags),row.id,b.id);
+        db.prepare('UPDATE banks SET updated_at=? WHERE id=?').run(now(),b.id);
+        return {...normalized,id:row.id};
+      });
+      return send(res,200,{question:saved,revision:hash(json(saved))});
+    }
+    throw fail(405,'请求方法不支持');
+  }
   const questionMatch = p.match(/^\/api\/banks\/([^/]+)\/questions$/);
   if (questionMatch) { const b = bank(questionMatch[1]); if (!b) throw fail(404, '题库不存在'); if (req.method === 'GET') { needAdmin(user); return send(res, 200, questions(b.id)); } if (req.method === 'PUT') { needAdmin(user); const normalized = normalizeQuestions(await getBody(req), b.id); transaction(db, () => { db.prepare('DELETE FROM questions WHERE bank_id=?').run(b.id); const insert = db.prepare('INSERT INTO questions(id,bank_id,number,type,stem,options_json,answer,explanation,chapter,tags_json) VALUES(?,?,?,?,?,?,?,?,?,?)'); for (const q of normalized) insert.run(q.id,b.id,q.number,q.type,q.stem,json(q.options),q.answer,q.explanation,q.chapter,json(q.tags)); db.prepare('UPDATE banks SET updated_at=? WHERE id=?').run(now(),b.id); }); return send(res, 200, summarize(normalized)); } }
   if (p === '/api/import/preview' && req.method === 'POST') { needAdmin(user); return send(res, 200, summarize(normalizeQuestions(await getBody(req), 'preview'))); }
   const chapterMatch = p.match(/^\/api\/banks\/([^/]+)\/chapters$/);
   if (chapterMatch && req.method === 'GET') { if (!bank(chapterMatch[1])) throw fail(404, '题库不存在'); return send(res, 200, summarize(questions(chapterMatch[1])).chapters); }
   const catalogMatch = p.match(/^\/api\/banks\/([^/]+)\/catalog$/);
-  if (catalogMatch && req.method === 'GET') { if (!bank(catalogMatch[1])) throw fail(404, '题库不存在'); const all=questions(catalogMatch[1]); return send(res,200,{ summary:summarize(all), tags:[...new Set(all.flatMap(q=>q.tags))].sort((a,b)=>a.localeCompare(b,'zh-CN')) }); }
+  if (catalogMatch && req.method === 'GET') { if (!bank(catalogMatch[1])) throw fail(404, '题库不存在'); const all=questions(catalogMatch[1]); return send(res,200,{ summary:summarize(all), entries:all.map(q=>({id:q.id,type:q.type,chapter:q.chapter,tags:q.tags})), tags:[...new Set(all.flatMap(q=>q.tags))].sort((a,b)=>a.localeCompare(b,'zh-CN')) }); }
   const bankTemplateMatch = p.match(/^\/api\/banks\/([^/]+)\/templates$/);
   if (bankTemplateMatch) { const b = bank(bankTemplateMatch[1]); if (!b) throw fail(404, '题库不存在'); if (req.method === 'GET') return send(res, 200, db.prepare('SELECT * FROM templates WHERE bank_id=? AND active=1 ORDER BY updated_at DESC').all(b.id).map(t => ({ id:t.id, bankId:t.bank_id, name:t.name, chapters:readJson(t.chapters_json), rules:readJson(t.rules_json), updatedAt:t.updated_at }))); if (req.method === 'POST') { needAdmin(user); const t = normalizeTemplate(await getBody(req), Object.keys(summarize(questions(b.id)).chapters)); const id = newId(); db.prepare('INSERT INTO templates(id,bank_id,name,chapters_json,rules_json,updated_at) VALUES(?,?,?,?,?,?)').run(id,b.id,t.name,json(t.chapters),json(t.rules),now()); return send(res, 201, { id, ...t }); } }
   const templateMatch = p.match(/^\/api\/templates\/([^/]+)$/);
@@ -218,7 +271,8 @@ async function api(req, res, url, user) {
   if (p === '/api/learning' && req.method === 'GET') { const bankId = url.searchParams.get('bankId'); if (!bank(bankId)) throw fail(404, '题库不存在'); const ids = questions(bankId).map(q => q.id); const rows = db.prepare('SELECT * FROM user_questions WHERE user_sub=?').all(user.sub).filter(row => ids.includes(row.question_id)); const latest = db.prepare('SELECT id,title,score,max_score,submitted_at FROM attempts WHERE user_sub=? AND bank_id=? AND submitted_at IS NOT NULL AND mode=\'exam\' ORDER BY submitted_at DESC LIMIT 20').all(user.sub,bankId); return send(res,200,{ items:Object.fromEntries(rows.map(r => [r.question_id,{ favorite:!!r.favorite,wrong:!!r.wrong,streak:r.streak,answeredCount:r.answered_count }])), history:latest }); }
   const favoriteMatch = p.match(/^\/api\/questions\/([^/]+)\/favorite$/);
   if (favoriteMatch && req.method === 'POST') { const q = db.prepare('SELECT id FROM questions WHERE id=?').get(favoriteMatch[1]); if (!q) throw fail(404, '题目不存在'); const current = db.prepare('SELECT favorite FROM user_questions WHERE user_sub=? AND question_id=?').get(user.sub,q.id)?.favorite || 0; db.prepare('INSERT INTO user_questions(user_sub,question_id,favorite) VALUES(?,?,?) ON CONFLICT(user_sub,question_id) DO UPDATE SET favorite=excluded.favorite').run(user.sub,q.id,current?0:1); return send(res,200,{favorite:!current}); }
-  if (p === '/api/attempts' && req.method === 'POST') { const body = await getBody(req); const b = bank(body.bankId); if (!b) throw fail(404, '题库不存在'); const all = questions(b.id); let picked,title,maxScore,templateId=null; if (body.mode === 'exam') { const t = template(body.templateId); if (!t || t.bank_id !== b.id) throw fail(400, '考试方案不属于此题库'); const spec = { chapters:readJson(t.chapters_json), rules:readJson(t.rules_json) }; picked = buildExam(all,spec); title=t.name; templateId=t.id; maxScore=picked.reduce((n,q)=>n+q.score,0); } else if (body.mode === 'practice') { const filters=body.filters||{},learning=db.prepare('SELECT * FROM user_questions WHERE user_sub=?').all(user.sub),map=new Map(learning.map(r=>[r.question_id,r])); if(filters.ids && (!Array.isArray(filters.ids)||filters.ids.length>10000)) throw fail(400,'指定题目范围无效'); const requested=filters.ids?new Set(filters.ids):null; picked=all.filter(q=>(!requested||requested.has(q.id))&&(!filters.chapter||filters.chapter==='all'||q.chapter===filters.chapter)&&(!filters.type||filters.type==='all'||q.type===filters.type)&&(!filters.tag||filters.tag==='all'||q.tags.includes(filters.tag))&&(!filters.source||filters.source==='all'||filters.source==='wrong'&&map.get(q.id)?.wrong||filters.source==='favorite'&&map.get(q.id)?.favorite)).map(q=>({...q,score:1})); picked=shuffle(picked); if (!picked.length) throw fail(400,'当前练习范围没有题目'); title=requested?'本次错题重练':'章节练习'; maxScore=picked.length; } else throw fail(400,'答题模式无效'); const id=newId(); db.prepare('INSERT INTO attempts(id,user_sub,bank_id,template_id,mode,title,snapshot_json,max_score,created_at) VALUES(?,?,?,?,?,?,?,?,?)').run(id,user.sub,b.id,templateId,body.mode,title,json(picked),Math.round(maxScore*100)/100,now()); return send(res,201,presentAttempt(attemptRow(id,user.sub))); }
+  if (p === '/api/attempts' && req.method === 'POST') { const body = await getBody(req); const b = bank(body.bankId); if (!b) throw fail(404, '题库不存在'); const all = questions(b.id); let picked,title,maxScore,templateId=null; if (body.mode === 'exam') { const t = template(body.templateId); if (!t || t.bank_id !== b.id) throw fail(400, '考试方案不属于此题库'); const spec = { chapters:readJson(t.chapters_json), rules:readJson(t.rules_json) }; try { picked = buildExam(all,spec); } catch(error) { throw fail(400,error.message); } title=t.name; templateId=t.id; maxScore=picked.reduce((n,q)=>n+q.score,0); } else if (body.mode === 'practice') { const filters=body.filters||{},learning=db.prepare('SELECT * FROM user_questions WHERE user_sub=?').all(user.sub),map=new Map(learning.map(r=>[r.question_id,r])); if(filters.ids && (!Array.isArray(filters.ids)||filters.ids.length>10000)) throw fail(400,'指定题目范围无效'); const requested=filters.ids?new Set(filters.ids):null; picked=all.filter(q=>(!requested||requested.has(q.id))&&(!filters.chapter||filters.chapter==='all'||q.chapter===filters.chapter)&&(!filters.type||filters.type==='all'||q.type===filters.type)&&(!filters.tag||filters.tag==='all'||q.tags.includes(filters.tag))&&(!filters.source||filters.source==='all'||filters.source==='wrong'&&map.get(q.id)?.wrong||filters.source==='favorite'&&map.get(q.id)?.favorite)).map(q=>({...q,score:1})); picked=shuffle(picked); if (!picked.length) throw fail(400,'当前练习范围没有题目'); title=requested?'本次错题重练':'章节练习'; maxScore=picked.length; } else throw fail(400,'答题模式无效'); const id=newId(); db.prepare('INSERT INTO attempts(id,user_sub,bank_id,template_id,mode,title,snapshot_json,max_score,created_at) VALUES(?,?,?,?,?,?,?,?,?)').run(id,user.sub,b.id,templateId,body.mode,title,json(picked),Math.round(maxScore*100)/100,now()); return send(res,201,presentAttempt(attemptRow(id,user.sub))); }
+  if (p === '/api/attempts' && req.method === 'GET' && url.searchParams.get('unfinished') === '1') return send(res,200,db.prepare('SELECT id,bank_id AS bankId,mode,title,position,json_array_length(snapshot_json) AS questionCount,created_at AS createdAt,submitted_at AS submittedAt FROM attempts WHERE user_sub=? AND submitted_at IS NULL ORDER BY created_at DESC').all(user.sub));
   if (p === '/api/attempts' && req.method === 'GET') return send(res,200,db.prepare('SELECT id,bank_id AS bankId,mode,title,score,max_score AS maxScore,created_at AS createdAt,submitted_at AS submittedAt FROM attempts WHERE user_sub=? ORDER BY created_at DESC LIMIT 50').all(user.sub));
   const attemptMatch=p.match(/^\/api\/attempts\/([^/]+)$/);
   if (attemptMatch && req.method === 'GET') return send(res,200,presentAttempt(attemptRow(attemptMatch[1],user.sub)));
@@ -233,7 +287,7 @@ async function api(req, res, url, user) {
   throw fail(404,'接口不存在');
 }
 
-const staticFiles = new Map([['/','index.html'],['/index.html','index.html'],['/login','login.html'],['/login.js','login.js'],['/styles.css','styles.css'],['/app.js','app.js']]);
+const staticFiles = new Map([['/','index.html'],['/index.html','index.html'],['/login','login.html'],['/login.js','login.js'],['/styles.css','styles.css'],['/app.js','app.js'],['/question-manager.js','question-manager.js']]);
 const mime = { '.html':'text/html; charset=utf-8', '.css':'text/css; charset=utf-8', '.js':'text/javascript; charset=utf-8' };
 const server = http.createServer(async(req,res)=>{
   try {
@@ -242,11 +296,12 @@ const server = http.createServer(async(req,res)=>{
     if(url.pathname.startsWith('/auth/')) return await authRoute(req,res,url);
     const user=sessionUser(req);
     if(url.pathname.startsWith('/api/')) return await api(req,res,url,user);
-    if(url.pathname === '/login' || url.pathname === '/login.js') {
+    if(['/login','/login.js','/styles.css'].includes(url.pathname) && ['GET','HEAD'].includes(req.method)) {
       if(user && url.pathname === '/login') return redirect(res,'/');
       const file=staticFiles.get(url.pathname);
       res.writeHead(200,{'Content-Type':mime[path.extname(file)],'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'});
-      return res.end(fs.readFileSync(path.join(root,'public',file)));
+      const content=file==='login.html'?fs.readFileSync(path.join(root,'public',file),'utf8').replace('__OIDC_ORIGIN__',(normalizeOrigin(appOrigin)||'').replace(/[&"<>]/g,c=>({'&':'&amp;','"':'&quot;','<':'&lt;','>':'&gt;'}[c]))):fs.readFileSync(path.join(root,'public',file));
+      return res.end(req.method==='HEAD'?undefined:content);
     }
     if(!user) return redirect(res,'/login');
     const file=staticFiles.get(url.pathname);

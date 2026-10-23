@@ -69,17 +69,34 @@ export function shuffle(input) {
   return values;
 }
 
+// Ignore import numbering, chapter labels and layout-only whitespace when comparing
+// content. Sort option text so a reordered copy cannot appear twice in one paper.
+const contentText = value => text(value).normalize('NFKC').replace(/\s+/gu, '');
+const questionContentKey = q => JSON.stringify([
+  q.type,
+  contentText(q.stem),
+  Object.values(q.options).map(contentText).sort(),
+]);
+
 export function buildExam(questions, template) {
   const selected = [];
   for (const type of TYPES) {
     const count = template.rules[type].count;
+    if (!count) continue;
     const byType = questions.filter(q => q.type === type);
-    if (byType.length < count) throw new Error(`${type}题不足：需要 ${count} 道，全库只有 ${byType.length} 道`);
-    const inside = template.chapters === 'all' ? byType : byType.filter(q => template.chapters.includes(q.chapter));
-    const first = shuffle(inside).slice(0, count);
-    const rest = count - first.length;
-    const outside = rest ? shuffle(byType.filter(q => !first.some(p => p.id === q.id) && !inside.some(p => p.id === q.id))).slice(0, rest) : [];
-    selected.push(...first, ...outside);
+    const inScope = q => template.chapters === 'all' || template.chapters.includes(q.chapter);
+    // Prefer the chosen chapters before collapsing copies found in other chapters.
+    const candidates = [...shuffle(byType.filter(inScope)), ...shuffle(byType.filter(q => !inScope(q)))];
+    const seenIds = new Set(), seenContent = new Set(), unique = [];
+    for (const q of candidates) {
+      const key = questionContentKey(q);
+      if (seenIds.has(q.id) || seenContent.has(key)) continue;
+      seenIds.add(q.id);
+      seenContent.add(key);
+      unique.push(q);
+    }
+    if (unique.length < count) throw new Error(`${type}题不足：需要 ${count} 道，去重后全库只有 ${unique.length} 道（原始 ${byType.length} 道）`);
+    selected.push(...unique.slice(0, count));
   }
   return selected.map(q => ({ ...q, score: template.rules[q.type].score }));
 }

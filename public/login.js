@@ -1,4 +1,11 @@
 'use strict';
+const oidcOrigin=document.querySelector('meta[name="light-exam-oidc-origin"]')?.content;
+if(oidcOrigin&&location.origin===oidcOrigin){
+  document.getElementById('oidcLoginGroup').classList.remove('hidden');
+  document.getElementById('oidcLoginNote').classList.remove('hidden');
+  document.getElementById('loginHelp').textContent='可使用懒猫微服账号免密登录，也可使用管理员分配的本地账号。';
+}
+
 const form=document.getElementById('loginForm');
 form.addEventListener('submit',async event=>{
   event.preventDefault();

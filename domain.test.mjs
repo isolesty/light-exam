@@ -42,3 +42,37 @@ test('SQLite 事务失败后保持原题库',()=>{
     db.close();
   }finally{fs.rmSync(dir,{recursive:true,force:true})}
 });
+
+
+test('同卷按内容去重，忽略题号、章节、空白、选项顺序和答案解析差异',()=>{
+  const base=make(1,'单选','第一章');
+  const rows=normalizeQuestions([
+    base,
+    {...base,number:2,tags:['章节:第二章'],stem:'第\n １ 题',options:{C:'选项二',A:'选项三',B:'选项一'},answer:'B',explanation:'另一份解析'},
+    make(3,'单选','第二章'),
+    {...base,number:4,options:{A:'另一个选项',B:'选项二',C:'选项三'}},
+    make(5,'多选','第一章'),
+    {...make(5,'多选','第二章'),number:6},
+    make(7,'判断','第一章'),
+    {...make(7,'判断','第二章'),number:8},
+  ],bank);
+  const config=normalizeTemplate({name:'去重模拟卷',chapters:['第一章'],rules:{单选:{count:3,score:.5},多选:{count:1,score:1.5},判断:{count:1,score:1}}},['第一章','第二章']);
+  for(let i=0;i<100;i++){
+    const exam=buildExam([...rows,rows[0]],config);
+    assert.equal(exam.length,5);
+    assert.equal(new Set(exam.map(q=>q.id)).size,5);
+    assert.ok(!exam.some(q=>['2','6','8'].includes(q.number)));
+    assert.ok(exam.some(q=>q.number==='4'),'相同题干但不同选项应保留');
+    assert.equal(grade(exam,Object.fromEntries(exam.map(q=>[q.id,q.answer]))).score,4);
+  }
+  assert.equal(rows.length,8,'抽题不得修改原始题库');
+  assert.throws(()=>buildExam(rows,{...config,rules:{...config.rules,单选:{count:4,score:.5}}}),/去重后全库只有 3 道/);
+  const all={...config,chapters:'all'};
+  for(let i=0;i<100;i++){
+    const exam=buildExam(rows,all);
+    assert.equal(exam.length,5);
+    assert.equal(exam.filter(q=>q.type==='单选').length,3);
+    assert.equal(exam.filter(q=>q.type==='多选').length,1);
+    assert.equal(exam.filter(q=>q.type==='判断').length,1);
+  }
+});

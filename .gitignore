@@ -3,3 +3,24 @@ runtime/
 release/*.lpk
 !release/.gitkeep
 node_modules/
+
+lzc-manifest.local.yml
+lzc-build.local.yml
+
+# Local secrets, application data and generated packages
+.env
+.env.*
+!.env.example
+*.local.yml
+*.local.yaml
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.lpk
+*.log
+*.pem
+*.key
+.DS_Store

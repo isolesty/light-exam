@@ -33,7 +33,7 @@ test('本地账号、OIDC 管理员映射、用户管理与考试隔离',async()
   try{
     issuer=await listen(provider);
     const origin=await freePort();
-    Object.assign(process.env,{NODE_ENV:'test',DATA_DIR:dir,APP_ORIGIN:origin,OIDC_CLIENT_ID:'light-exam-test',OIDC_CLIENT_SECRET:'test-secret',OIDC_ISSUER:issuer,OIDC_AUTH_URI:`${issuer}/auth`,OIDC_TOKEN_URI:`${issuer}/token`,OIDC_USERINFO_URI:`${issuer}/userinfo`});
+    Object.assign(process.env,{NODE_ENV:'test',DATA_DIR:dir,APP_ORIGIN:origin,ALLOWED_ORIGINS:'https://external.example.test',OIDC_CLIENT_ID:'light-exam-test',OIDC_CLIENT_SECRET:'test-secret',OIDC_ISSUER:issuer,OIDC_AUTH_URI:`${issuer}/auth`,OIDC_TOKEN_URI:`${issuer}/token`,OIDC_USERINFO_URI:`${issuer}/userinfo`});
     ({server:app}=await import('./server.mjs'));
     await new Promise(resolve=>app.listen(Number(new URL(origin).port),'127.0.0.1',resolve));
     const login=async(expectedStatus=303)=>{
@@ -48,9 +48,36 @@ test('本地账号、OIDC 管理员映射、用户管理与考试隔离',async()
     };
     const request=async(cookie,url,method='GET',body)=>{const r=await fetch(origin+url,{method,headers:{Cookie:cookie,...(body===undefined?{}:{Origin:origin,'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body),redirect:'manual'});return{status:r.status,data:await r.json()}};
     const localLogin=async(username,password)=>{const response=await fetch(origin+'/api/auth/login',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:JSON.stringify({username,password})});return {status:response.status,data:await response.json(),cookie:response.headers.get('set-cookie')?.split(';')[0]}};
-    assert.equal((await fetch(origin+'/login')).status,200);
+    const loginPage=await fetch(origin+'/login');assert.equal(loginPage.status,200);const loginHtml=await loginPage.text();assert.ok(loginHtml.includes(`name="light-exam-oidc-origin" content="${origin}"`));assert.ok(!loginHtml.includes('__OIDC_ORIGIN__'));assert.ok(loginHtml.includes('id="oidcLoginGroup" class="hidden"'));
+    const publicStyles=await fetch(origin+'/styles.css',{redirect:'manual'});
+    assert.equal(publicStyles.status,200);
+    assert.match(publicStyles.headers.get('content-type'),/^text\/css/);
+    assert.ok((await publicStyles.text()).includes('.login-panel'));
+    assert.equal((await fetch(origin+'/',{redirect:'manual'})).status,303);
+    assert.equal((await fetch(origin+'/api/banks',{redirect:'manual'})).status,401);
     assert.equal((await localLogin('admin','Unconfigured123')).status,401);
+    const originProbe=async(browserOrigin,extraHeaders={})=>fetch(origin+'/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json',...(browserOrigin===undefined?{}:{Origin:browserOrigin}),...extraHeaders},body:JSON.stringify({username:'origin-probe',password:'ProbeOnly123'})});
+    assert.equal((await originProbe('https://external.example.test')).status,401);
+    for(const rejected of [undefined,'null','https://untrusted.example.test','https://external.example.test.attacker.test','https://external.example.test:8443','http://external.example.test','https://external.example.test/path'])assert.equal((await originProbe(rejected)).status,403);
+    assert.equal((await originProbe('https://untrusted.example.test',{'X-Forwarded-Host':'external.example.test','X-Forwarded-Proto':'https',Host:'external.example.test'})).status,403);
+
     const admin=await login();
+    const initialAccess=await request(admin,'/api/settings/access');
+    assert.deepEqual(initialAccess.data,{defaultOrigin:origin,origins:['https://external.example.test']});
+    assert.equal((await fetch(origin+'/api/settings/access')).status,401);
+    const savedAccess=await request(admin,'/api/settings/access','PUT',{origins:[origin,'https://NEW.example.test/','https://new.example.test']});
+    assert.equal(savedAccess.status,200);
+    assert.deepEqual(savedAccess.data.origins,['https://new.example.test']);
+    assert.equal((await originProbe('https://new.example.test')).status,401);
+    assert.equal((await originProbe('https://external.example.test')).status,403);
+    assert.equal((await originProbe(origin)).status,401);
+    for(const invalid of [['https://*.example.test'],['https://user:pass@example.test'],['https://example.test/path'],['https://example.test?q=1'],['ftp://example.test'],['null'],[42],Array(21).fill('https://example.test')]){
+      assert.equal((await request(admin,'/api/settings/access','PUT',{origins:invalid})).status,400);
+      assert.deepEqual((await request(admin,'/api/settings/access')).data.origins,['https://new.example.test']);
+    }
+    assert.equal((await request(admin,'/api/settings/access','PUT',{origins:[]})).status,200);
+    assert.equal((await originProbe('https://new.example.test')).status,403);
+    assert.equal((await originProbe(origin)).status,401);
     assert.equal((await request(admin,'/api/me')).data.mustChangePassword,false);
     assert.equal((await request(admin,'/api/me/password','PATCH',{newPassword:'weak'})).status,400);
     assert.equal((await request(admin,'/api/me/password','PATCH',{newPassword:'ChosenLocal785A'})).status,200);
@@ -66,6 +93,24 @@ test('本地账号、OIDC 管理员映射、用户管理与考试隔离',async()
     const questions=[{number:1,stem:'单选题',options:{A:'甲',B:'乙'},answer:'A',tags:['单选','章节:第一章']},{number:2,stem:'多选题',options:{A:'甲',B:'乙',C:'丙'},answer:'AC',tags:['多选','章节:第二章']}];
     assert.equal((await request(admin,`/api/banks/${bankId}/questions`,'PUT',{questions})).status,200);
     const plan=await request(admin,`/api/banks/${bankId}/templates`,'POST',{name:'测试卷',chapters:['第一章'],rules:{单选:{count:1,score:.5},多选:{count:1,score:2},判断:{count:0,score:1}}});assert.equal(plan.status,201);
+    const duplicateBank=(await request(admin,'/api/banks','POST',{name:'重复内容回归题库'})).data.id;
+    const duplicates=[
+      {number:1,stem:'演示重复题目',type:'单选',options:{A:'选项甲',B:'选项乙'},answer:'A',tags:['章节:第一章']},
+      {number:2,stem:'演示重复题目',type:'单选',options:{A:'选项乙',B:'选项甲'},answer:'B',tags:['章节:第二章']},
+      {number:3,stem:'演示不同题目',type:'单选',options:{A:'选项甲',B:'选项乙'},answer:'A',tags:['章节:第二章']},
+    ];
+    assert.equal((await request(admin,`/api/banks/${duplicateBank}/questions`,'PUT',{questions:duplicates})).status,200);
+    const duplicatePlan=await request(admin,`/api/banks/${duplicateBank}/templates`,'POST',{name:'去重测试卷',chapters:['第一章'],rules:{单选:{count:2,score:.5}}});
+    const dedupAttempt=await request(admin,'/api/attempts','POST',{mode:'exam',bankId:duplicateBank,templateId:duplicatePlan.data.id});
+    assert.equal(dedupAttempt.status,201);
+    assert.equal(dedupAttempt.data.questions.length,2);
+    assert.equal(new Set(dedupAttempt.data.questions.map(q=>q.stem)).size,2);
+    assert.equal(dedupAttempt.data.questions[0].chapter,'第一章');
+    await request(admin,`/api/attempts/${dedupAttempt.data.id}/submit`,'POST',{});
+    const tooMany=await request(admin,`/api/banks/${duplicateBank}/templates`,'POST',{name:'数量不足测试卷',chapters:'all',rules:{单选:{count:3,score:.5}}});
+    const rejectedAttempt=await request(admin,'/api/attempts','POST',{mode:'exam',bankId:duplicateBank,templateId:tooMany.data.id});
+    assert.equal(rejectedAttempt.status,400);
+    assert.match(rejectedAttempt.data.error,/去重后全库只有 2 道/);
     identity={sub:'student-1',name:'考生',groups:[]};
     const oidcStudent=await login();
     const oidcMe=await request(oidcStudent,'/api/me');
@@ -74,22 +119,50 @@ test('本地账号、OIDC 管理员映射、用户管理与考试隔离',async()
     assert.equal(oidcMe.data.authMethod,'oidc');
     assert.equal((await request(oidcStudent,'/api/banks','POST',{name:'OIDC 用户不能管理'})).status,403);
     assert.equal((await request(oidcStudent,'/api/me/password','PATCH',{newPassword:'Another1234'})).status,403);
+    assert.equal((await request(oidcStudent,'/api/settings/access')).status,403);
+    assert.equal((await request(oidcStudent,'/api/settings/access','PUT',{origins:['https://intruder.example.test']})).status,403);
     const studentLogin=await localLogin('student1','Student1234');assert.equal(studentLogin.status,200);assert.equal(studentLogin.data.mustChangePassword,true);
     const student=studentLogin.cookie;
+    const catalogResponse=await request(admin,`/api/banks/${bankId}/catalog`);
+    assert.equal(catalogResponse.data.entries.length,2);
+    assert.ok(catalogResponse.data.entries.every(entry=>Object.keys(entry).sort().join(',')==='chapter,id,tags,type'));
     assert.equal((await request(student,'/api/attempts')).status,403);
     assert.equal((await request(student,'/api/me/password','PATCH',{currentPassword:'Student1234',newPassword:'Student5678'})).status,200);
     assert.equal((await request(student,'/api/me')).data.canManage,false);
     assert.equal((await request(student,'/api/banks','POST',{name:'非法题库'})).status,403);
+    assert.equal((await request(student,`/api/banks/${bankId}/questions`)).status,403);
+    assert.equal((await request(admin,`/api/banks/${bankId}/questions`)).data.length,2);
     const started=await request(student,'/api/attempts','POST',{mode:'exam',bankId,templateId:plan.data.id});assert.equal(started.status,201);
+    const unfinished=await request(student,'/api/attempts?unfinished=1');assert.equal(unfinished.status,200);assert.equal(unfinished.data.length,1);assert.equal(unfinished.data[0].id,started.data.id);assert.equal(unfinished.data[0].questionCount,2);assert.ok(!Object.hasOwn(unfinished.data[0],'questions'));assert.deepEqual((await request(admin,'/api/attempts?unfinished=1')).data,[]);
     assert.equal(started.data.questions.length,2);assert.ok(started.data.questions.every(q=>!Object.hasOwn(q,'answer')));
     const single=started.data.questions.find(q=>q.type==='单选'),multiple=started.data.questions.find(q=>q.type==='多选');
     assert.equal(multiple.chapter,'第二章');
     assert.equal((await request(student,`/api/attempts/${started.data.id}/progress`,'PATCH',{questionId:single.id,answer:'A',position:0})).status,200);
     assert.equal((await request(student,`/api/attempts/${started.data.id}/progress`,'PATCH',{questionId:multiple.id,answer:'AB',position:1})).status,200);
     const result=await request(student,`/api/attempts/${started.data.id}/submit`,'POST',{});
+    assert.deepEqual((await request(student,'/api/attempts?unfinished=1')).data,[]);
     assert.equal(result.data.stats.score,.5);assert.equal(result.data.stats.maxScore,2.5);
     assert.equal(result.data.questions.find(q=>q.id===multiple.id).answer,'AC');
     assert.equal((await request(admin,`/api/attempts/${started.data.id}`)).status,404);
+    const editUrl=`/api/banks/${bankId}/questions/${single.id}`;
+    assert.equal((await fetch(origin+editUrl)).status,401);
+    assert.equal((await request(student,editUrl)).status,403);
+    const edit=await request(admin,editUrl);assert.equal(edit.status,200);
+    assert.equal((await request(admin,`/api/banks/${duplicateBank}/questions/${single.id}`)).status,404);
+    await request(student,`/api/questions/${single.id}/favorite`,'POST',{});
+    const learningBefore=(await request(student,`/api/learning?bankId=${bankId}`)).data.items;
+    const corrected={...edit.data.question,number:'99',stem:'已纠正的题干',answer:'B',explanation:'更正后的解析',tags:['单选','章节:更正章节','重点']};
+    assert.equal((await request(student,editUrl,'PUT',{question:corrected,revision:edit.data.revision})).status,403);
+    for(const invalid of [{...corrected,answer:'Z'},{...corrected,stem:''},{...corrected,type:'其他'},{...corrected,options:{A:'只有一个选项'}}])assert.equal((await request(admin,editUrl,'PUT',{question:invalid,revision:edit.data.revision})).status,400);
+    const updated=await request(admin,editUrl,'PUT',{question:corrected,revision:edit.data.revision});assert.equal(updated.status,200);assert.equal(updated.data.question.id,single.id);assert.equal(updated.data.question.chapter,'更正章节');
+    assert.equal((await request(admin,editUrl,'PUT',{question:corrected,revision:edit.data.revision})).status,409);
+    assert.deepEqual((await request(student,`/api/learning?bankId=${bankId}`)).data.items,learningBefore);
+    const oldSnapshot=(await request(student,`/api/attempts/${started.data.id}`)).data.questions.find(q=>q.id===single.id);
+    assert.equal(oldSnapshot.stem,single.stem);assert.equal(oldSnapshot.answer,'A');
+    const correctedExam=await request(admin,'/api/attempts','POST',{mode:'exam',bankId,templateId:plan.data.id});assert.equal(correctedExam.status,201);assert.equal(correctedExam.data.questions.find(q=>q.id===single.id).stem,'已纠正的题干');
+    const newer=await request(student,'/api/attempts','POST',{mode:'practice',bankId,filters:{ids:[single.id]}});assert.equal(newer.status,201);assert.equal(newer.data.questions[0].stem,'已纠正的题干');
+    await request(student,`/api/attempts/${newer.data.id}/progress`,'PATCH',{questionId:single.id,answer:'A',position:0});
+    const confirmed=await request(student,`/api/attempts/${newer.data.id}/confirm`,'POST',{questionId:single.id});assert.equal(confirmed.data.answer,'B');assert.equal(confirmed.data.explanation,'更正后的解析');
     assert.equal((await request(admin,'/api/users/student1/password','PUT',{password:'Reset9876A'})).status,200);
     assert.equal((await request(student,'/api/me')).status,401);
     const resetLogin=await localLogin('student1','Reset9876A');assert.equal(resetLogin.status,200);
