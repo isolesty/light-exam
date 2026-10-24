@@ -76,6 +76,44 @@ const mappedAttempt = row => ({ id: row.id, bankId: row.bank_id, templateId: row
 const attemptRow = (id, sub) => { const row = db.prepare('SELECT * FROM attempts WHERE id=? AND user_sub=?').get(id, sub); if (!row) throw fail(404, '答题记录不存在'); return row; };
 const presentAttempt = row => { const a = mappedAttempt(row); return { ...a, questions: a.questions.map(q => a.submittedAt || (a.mode === 'practice' && a.confirmed[q.id]) ? q : publicQuestion(q)), stats: a.submittedAt ? grade(a.questions, a.answers) : undefined }; };
 const validateChoice = (q, answer) => { if (answer && (![...answer].every(c => Object.hasOwn(q.options, c)) || (q.type !== '多选' && answer.length !== 1))) throw fail(400, '答案不属于本题选项'); };
+const objectBody = value => value && typeof value === 'object' && !Array.isArray(value);
+function applyAttemptProgress(a, body, final = false) {
+  if (!objectBody(body)) throw fail(400,'答题数据格式无效');
+  const byId=new Map(a.questions.map(q=>[q.id,q]));
+  const apply=(change)=>{
+    if (!objectBody(change)) throw fail(400,'题目进度格式无效');
+    const q=byId.get(change.questionId);
+    if (!q) throw fail(400,'题目不属于本次答题');
+    if (Object.hasOwn(change,'answer')) {
+      if (typeof change.answer !== 'string') throw fail(400,'答案格式无效');
+      const answer=normalizeAnswer(change.answer);validateChoice(q,answer);
+      if (a.confirmed[q.id] && answer!==(a.answers[q.id]||'')) throw fail(409,'本题已确认，不能修改答案');
+      a.answers[q.id]=answer;
+    }
+    if (Object.hasOwn(change,'marked')) {
+      if (typeof change.marked !== 'boolean') throw fail(400,'标记格式无效');
+      a.marks[q.id]=change.marked;
+    }
+  };
+  if (final) {
+    if (Object.hasOwn(body,'answers')) {
+      if (!objectBody(body.answers) || Object.keys(body.answers).some(id=>!byId.has(id))) throw fail(400,'交卷答案包含无效题目');
+      for (const q of a.questions) apply({questionId:q.id,answer:body.answers[q.id]??''});
+    }
+    if (Object.hasOwn(body,'marks')) {
+      if (!objectBody(body.marks) || Object.keys(body.marks).some(id=>!byId.has(id))) throw fail(400,'交卷标记包含无效题目');
+      for (const q of a.questions) apply({questionId:q.id,marked:body.marks[q.id]??false});
+    }
+  } else if (Object.hasOwn(body,'changes')) {
+    if (!Array.isArray(body.changes) || body.changes.length>10000) throw fail(400,'批量进度格式无效');
+    for (const change of body.changes) apply(change);
+  } else apply(body);
+  if (Object.hasOwn(body,'position')) {
+    if (!Number.isInteger(body.position)||body.position<0||body.position>=a.questions.length) throw fail(400,'题号无效');
+    a.position=body.position;
+  }
+  return a;
+}
 const updateLearning = (sub, q, answer) => {
   if (!answer) return;
   const current = db.prepare('SELECT * FROM user_questions WHERE user_sub=? AND question_id=?').get(sub, q.id) || { favorite: 0, wrong: 0, streak: 0, answered_count: 0 };
@@ -285,13 +323,42 @@ async function api(req, res, url, user) {
   }
 
   const progressMatch=p.match(/^\/api\/attempts\/([^/]+)\/progress$/);
-  if (progressMatch && req.method === 'PATCH') { const row=attemptRow(progressMatch[1],user.sub); if(row.submitted_at) throw fail(409,'已交卷'); const a=mappedAttempt(row), body=await getBody(req); const q=a.questions.find(q=>q.id===body.questionId); if(!q) throw fail(400,'题目不属于本次答题'); if(a.confirmed[q.id] && (body.marked===undefined || normalizeAnswer(body.answer)!==a.answers[q.id])) throw fail(409,'本题已确认'); const answer=normalizeAnswer(body.answer); validateChoice(q,answer); if(!a.confirmed[q.id]) a.answers[q.id]=answer; if(body.position!==undefined) { if(!Number.isInteger(body.position)||body.position<0||body.position>=a.questions.length) throw fail(400,'题号无效'); a.position=body.position; } if(body.marked!==undefined) a.marks[q.id]=!!body.marked; db.prepare('UPDATE attempts SET answers_json=?,marks_json=?,position=? WHERE id=?').run(json(a.answers),json(a.marks),a.position,a.id); return send(res,200,{ok:true}); }
+  if (progressMatch && req.method === 'PATCH') {
+    const body=await getBody(req);
+    transaction(db,()=>{
+      const row=attemptRow(progressMatch[1],user.sub);
+      if(row.submitted_at) throw fail(409,'已交卷');
+      const a=applyAttemptProgress(mappedAttempt(row),body);
+      db.prepare('UPDATE attempts SET answers_json=?,marks_json=?,position=? WHERE id=?').run(json(a.answers),json(a.marks),a.position,a.id);
+    });
+    return send(res,200,{ok:true});
+  }
   const positionMatch=p.match(/^\/api\/attempts\/([^/]+)\/position$/);
-  if(positionMatch && req.method==='PATCH'){ const row=attemptRow(positionMatch[1],user.sub); if(row.submitted_at) throw fail(409,'已交卷'); const body=await getBody(req),size=readJson(row.snapshot_json).length; if(!Number.isInteger(body.position)||body.position<0||body.position>=size) throw fail(400,'题号无效'); db.prepare('UPDATE attempts SET position=? WHERE id=?').run(body.position,row.id); return send(res,200,{ok:true}); }
+  if(positionMatch && req.method==='PATCH'){
+    const body=await getBody(req),row=attemptRow(positionMatch[1],user.sub);
+    if(row.submitted_at) throw fail(409,'已交卷');
+    const size=readJson(row.snapshot_json).length;
+    if(!Number.isInteger(body?.position)||body.position<0||body.position>=size) throw fail(400,'题号无效');
+    db.prepare('UPDATE attempts SET position=? WHERE id=?').run(body.position,row.id);
+    return send(res,200,{ok:true});
+  }
   const confirmMatch=p.match(/^\/api\/attempts\/([^/]+)\/confirm$/);
-  if(confirmMatch && req.method==='POST'){ const row=attemptRow(confirmMatch[1],user.sub),a=mappedAttempt(row); if(a.submittedAt||a.mode!=='practice') throw fail(409,'本次答题不能逐题确认'); const body=await getBody(req); const q=a.questions.find(q=>q.id===String(body.questionId)); if(!q||!a.answers[q.id]) throw fail(400,'请先答题'); if(!a.confirmed[q.id]) transaction(db,()=>{ a.confirmed[q.id]=true; db.prepare('UPDATE attempts SET confirmed_json=? WHERE id=?').run(json(a.confirmed),a.id); updateLearning(user.sub,q,a.answers[q.id]); }); return send(res,200,{answer:q.answer,explanation:q.explanation,correct:a.answers[q.id]===q.answer}); }
+  if(confirmMatch && req.method==='POST'){ const body=await getBody(req),row=attemptRow(confirmMatch[1],user.sub),a=mappedAttempt(row); if(a.submittedAt||a.mode!=='practice') throw fail(409,'本次答题不能逐题确认'); const q=a.questions.find(q=>q.id===String(body.questionId)); if(!q||!a.answers[q.id]) throw fail(400,'请先答题'); if(!a.confirmed[q.id]) transaction(db,()=>{ a.confirmed[q.id]=true; db.prepare('UPDATE attempts SET confirmed_json=? WHERE id=?').run(json(a.confirmed),a.id); updateLearning(user.sub,q,a.answers[q.id]); }); return send(res,200,{answer:q.answer,explanation:q.explanation,correct:a.answers[q.id]===q.answer}); }
   const submitMatch=p.match(/^\/api\/attempts\/([^/]+)\/submit$/);
-  if(submitMatch && req.method==='POST'){ const row=attemptRow(submitMatch[1],user.sub),a=mappedAttempt(row); if(a.submittedAt) return send(res,200,presentAttempt(row)); const result=grade(a.questions,a.answers); transaction(db,()=>{ for(const q of a.questions) if(!a.confirmed[q.id]) updateLearning(user.sub,q,a.answers[q.id]); db.prepare('UPDATE attempts SET submitted_at=?,score=? WHERE id=?').run(now(),result.score,a.id); }); return send(res,200,presentAttempt(attemptRow(a.id,user.sub))); }
+  if(submitMatch && req.method==='POST'){
+    const body=await getBody(req);
+    const row=transaction(db,()=>{
+      const current=attemptRow(submitMatch[1],user.sub);
+      if(current.submitted_at) return current;
+      const a=applyAttemptProgress(mappedAttempt(current),body,true);
+      const result=grade(a.questions,a.answers);
+      for(const q of a.questions) if(!a.confirmed[q.id]) updateLearning(user.sub,q,a.answers[q.id]);
+      db.prepare('UPDATE attempts SET answers_json=?,marks_json=?,position=?,submitted_at=?,score=? WHERE id=?')
+        .run(json(a.answers),json(a.marks),a.position,now(),result.score,a.id);
+      return attemptRow(a.id,user.sub);
+    });
+    return send(res,200,presentAttempt(row));
+  }
   throw fail(404,'接口不存在');
 }
 

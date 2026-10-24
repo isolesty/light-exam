@@ -214,6 +214,35 @@ test('本地账号、OIDC 管理员映射、用户管理与考试隔离',async()
     }
     const sourceAfter=(await request(admin,`/api/banks/${shuffleBank}/questions`)).data;
     assert.deepEqual(sourceAfter.map(q=>({options:q.options,answer:q.answer})),originalChoices.map(q=>({options:q.options,answer:q.answer})));
+    // Batch saves and authoritative one-request submission.
+    const atomic=(await request(student,'/api/attempts','POST',{mode:'practice',bankId:shuffleBank})).data;
+    const finalAnswers=Object.fromEntries(atomic.questions.map(q=>[q.id,Object.entries(q.options).filter(([,label])=>['正确项','正确一','正确二','对'].includes(label)).map(([letter])=>letter).sort().join('')]));
+    const firstAtomic=atomic.questions[0],prime={changes:[{questionId:firstAtomic.id,answer:finalAnswers[firstAtomic.id],marked:true}],position:1};
+    assert.equal((await request(student,`/api/attempts/${atomic.id}/progress`,'PATCH',prime)).status,200);
+    const beforeInvalid=(await request(student,`/api/attempts/${atomic.id}`)).data;
+    assert.equal((await request(student,`/api/attempts/${atomic.id}/progress`,'PATCH',{changes:[{questionId:firstAtomic.id,answer:''},{questionId:'foreign-question',answer:'A'}],position:2})).status,400);
+    assert.deepEqual((await request(student,`/api/attempts/${atomic.id}`)).data,beforeInvalid);
+    assert.equal((await request(student,`/api/attempts/${atomic.id}/submit`,'POST',{answers:{'foreign-question':'A'}})).status,400);
+    assert.equal((await request(student,`/api/attempts/${atomic.id}/submit`,'POST',{answers:finalAnswers,marks:{[firstAtomic.id]:'yes'}})).status,400);
+    assert.deepEqual((await request(student,`/api/attempts/${atomic.id}`)).data,beforeInvalid);
+    assert.equal((await request(admin,`/api/attempts/${atomic.id}/submit`,'POST',{answers:finalAnswers})).status,404);
+    // Start requests before submission, but finish their bodies only after commit.
+    // They must re-read state after await getBody(), not overwrite the final data.
+    const deferBody=async(suffix,body)=>{
+      const target=`/api/attempts/${atomic.id}/${suffix}`,wire=JSON.stringify(body);
+      let startedResolve;const arrived=new Promise(resolve=>startedResolve=resolve);
+      const watch=req=>{if(req.url===target&&req.headers['x-deferred-test']==='1'){app.off('request',watch);startedResolve()}};app.on('request',watch);
+      let req;const response=new Promise((resolve,reject)=>{req=http.request(origin+target,{method:suffix==='confirm'?'POST':'PATCH',headers:{Cookie:student,Origin:origin,'Content-Type':'application/json','X-Deferred-Test':'1'}},res=>{let data='';res.on('data',chunk=>data+=chunk);res.on('end',()=>resolve({status:res.statusCode,data:JSON.parse(data)}))});req.on('error',reject);req.write(wire.slice(0,1))});
+      await arrived;return {finish:()=>{req.end(wire.slice(1));return response}};
+    };
+    const delayed=[await deferBody('progress',{changes:[{questionId:firstAtomic.id,answer:''}],position:0}),await deferBody('position',{position:0}),await deferBody('confirm',{questionId:firstAtomic.id})];
+    const submitted=(await request(student,`/api/attempts/${atomic.id}/submit`,'POST',{answers:finalAnswers,marks:{[firstAtomic.id]:false},position:2}));
+    assert.equal(submitted.status,200);assert.equal(submitted.data.stats.score,3);assert.deepEqual(submitted.data.answers,finalAnswers);assert.equal(submitted.data.position,2);assert.equal(submitted.data.marks[firstAtomic.id],false);
+    for(const late of delayed)assert.equal((await late.finish()).status,409);
+    const learningAfterSubmit=(await request(student,`/api/learning?bankId=${shuffleBank}`)).data;
+    const repeated=await request(student,`/api/attempts/${atomic.id}/submit`,'POST',{answers:{},position:0});assert.deepEqual(repeated.data,submitted.data);
+    assert.deepEqual((await request(student,`/api/learning?bankId=${shuffleBank}`)).data,learningAfterSubmit);
+    assert.deepEqual((await request(student,`/api/attempts/${atomic.id}`)).data,submitted.data);
     assert.equal((await request(admin,'/api/users/student1/password','PUT',{password:'Reset9876A'})).status,200);
     assert.equal((await request(student,'/api/me')).status,401);
     const resetLogin=await localLogin('student1','Reset9876A');assert.equal(resetLogin.status,200);
