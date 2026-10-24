@@ -147,7 +147,41 @@ async function exportBank(target,format){const source=await api(`/api/banks/${ta
 function askExport(target){if(!target?.count)return toast('此题库暂无题目');modal('导出题库',`导出“${target.name}”的全部题目，包含选项、答案、解析、题型和章节标签。JSON 适合完整备份，CSV 可用 Excel 查看；两种格式均可重新导入。`,()=>writeOnce('export',['modalConfirm','exportCsvBtn','modalCancel'],()=>exportBank(target,'json')),'导出 JSON');$('modalExtra').classList.remove('hidden');const button=document.createElement('button');button.id='exportCsvBtn';button.type='button';button.className='secondary-button wide';button.textContent='导出 CSV（Excel 可打开）';button.onclick=()=>run(()=>writeOnce('export',['exportCsvBtn','modalConfirm','modalCancel'],()=>exportBank(target,'csv')));$('modalExtra').append(button)}
 function downloadTemplate(){const data='序号,题干,选项 A,选项 B,选项 C,选项 D,选项 E,解析,答案,标签\r\n1,示例单选题,选项一,选项二,选项三,选项四,,这里写解析,B,"单选,章节:第一章,重点"\r\n2,示例多选题,选项一,选项二,选项三,选项四,选项五,这里写解析,AC,"多选,章节:第二章"\r\n3,示例判断题,对,错,,,,这里写解析,A,"判断,章节:第二章"\r\n';const url=URL.createObjectURL(new Blob(['\ufeff'+data],{type:'text/csv;charset=utf-8'})),a=document.createElement('a');a.href=url;a.download='轻量考试题库模板.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}
 async function run(action){try{await action()}catch(error){toast(error.message)}}
-function bind(){ $('accessForm').onsubmit=event=>run(()=>saveAccessSettings(event));$('reloadAccessBtn').onclick=()=>run(loadAccessSettings); $('retryBankBtn').onclick=()=>run(async()=>{await switchBank(failedBankId,failedBankView)});$('resumeSelectedBtn').onclick=()=>run(resumeSelected);$('deleteAttemptBtn').onclick=()=>askDeleteAttempt(attempt?.id);$('deleteSelectedAttemptBtn').onclick=()=>askDeleteAttempt($('unfinishedSelect').value);$('clearAdvancedBtn').onclick=()=>{for(const id of ['sourceSelect','tagSelect'])$(id).value='all';updateScope()};
+// Keep a slightly drifting finger tap reliable without treating a swipe as a tap.
+function bindFooterTouch(){
+ const footer=document.querySelector('.question-footer');
+ let touch=null,suppressNativeClick=false;
+ const moved=(event,tap)=>Math.hypot(event.clientX-tap.x,event.clientY-tap.y)>20;
+ document.addEventListener('pointerdown',()=>{suppressNativeClick=false},true);
+ footer.addEventListener('pointerdown',event=>{
+   suppressNativeClick=false;
+   if(event.pointerType!=='touch')return;
+   if(!event.isPrimary){touch=null;suppressNativeClick=true;return}
+   const button=event.target.closest('button');
+   if(!button||button.disabled||view!=='quiz'||quizBusy||!matchMedia('(max-width:850px)').matches)return;
+   touch={id:event.pointerId,button,x:event.clientX,y:event.clientY,dragged:false,attemptId:attempt?.id,position:attempt?.position};
+   button.setPointerCapture(event.pointerId);
+ });
+ footer.addEventListener('pointermove',event=>{
+   if(touch?.id===event.pointerId&&moved(event,touch))touch.dragged=true;
+ });
+ footer.addEventListener('pointerup',event=>{
+   if(touch?.id!==event.pointerId)return;
+   const tap=touch;touch=null;suppressNativeClick=true;
+   if(tap.dragged||moved(event,tap)||tap.button.disabled||view!=='quiz'||quizBusy||attempt?.id!==tap.attemptId||attempt?.position!==tap.position)return;
+   const box=tap.button.getBoundingClientRect();
+   if(event.clientX<box.left-8||event.clientX>box.right+8||event.clientY<box.top-8||event.clientY>box.bottom+8)return;
+   event.preventDefault();
+   tap.button.click();
+ });
+ footer.addEventListener('pointercancel',event=>{if(touch?.id===event.pointerId){touch=null;suppressNativeClick=true}});
+ // Capture globally: opening the card can retarget the compatibility click
+ // to a control in the newly displayed overlay. A new pointer-down resets this.
+ document.addEventListener('click',event=>{
+   if(suppressNativeClick&&event.isTrusted&&event.detail>0){event.preventDefault();event.stopImmediatePropagation()}
+ },true);
+}
+function bind(){ bindFooterTouch(); $('accessForm').onsubmit=event=>run(()=>saveAccessSettings(event));$('reloadAccessBtn').onclick=()=>run(loadAccessSettings); $('retryBankBtn').onclick=()=>run(async()=>{await switchBank(failedBankId,failedBankView)});$('resumeSelectedBtn').onclick=()=>run(resumeSelected);$('deleteAttemptBtn').onclick=()=>askDeleteAttempt(attempt?.id);$('deleteSelectedAttemptBtn').onclick=()=>askDeleteAttempt($('unfinishedSelect').value);$('clearAdvancedBtn').onclick=()=>{for(const id of ['sourceSelect','tagSelect'])$(id).value='all';updateScope()};
  $('newBankBtn').onclick=()=>{setEditor('bank',true);$('newBankName').focus()};$('cancelBankBtn').onclick=()=>setEditor('bank',false);$('bankSearch').oninput=renderBankList;
  $('newUserBtn').onclick=newUser;$('cancelPlanBtn').onclick=()=>{resetPlan();setEditor('plan',false)};
  document.addEventListener('click',event=>{if(!$('accountMenu').contains(event.target))$('accountMenu').open=false});

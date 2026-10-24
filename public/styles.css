@@ -594,3 +594,15 @@ button:disabled { box-shadow: none; transform: none; }
 
 .resume-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
 @media(max-width:480px){.resume-attempt{flex-wrap:wrap}.resume-actions{width:100%;justify-content:flex-end}}
+
+/* Stable mobile navigation and tolerant taps; the question body still scrolls. */
+@media(max-width:850px){
+ .question-footer{touch-action:none;user-select:none;-webkit-user-select:none}
+ .question-footer button{min-height:52px;touch-action:none;-webkit-tap-highlight-color:transparent;transform:none}
+ .question-footer .right-buttons{justify-content:flex-end}
+ .question-footer #nextBtn{flex:0 0 clamp(104px,32vw,160px);min-width:104px;margin-left:auto}
+ .question-footer #confirmBtn{flex:0 0 88px}
+ .quiz-view{padding-bottom:calc(104px + env(safe-area-inset-bottom))}
+ #toast{bottom:calc(100px + env(safe-area-inset-bottom))}
+}
+@media(max-width:420px){.question-footer #confirmBtn{flex-basis:76px}}
