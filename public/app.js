@@ -22,7 +22,21 @@ function openCard(){cardReturn=document.activeElement;$('cardPanel').classList.a
 function closeCard(){const wasOpen=$('cardPanel').classList.contains('open');$('cardPanel').classList.remove('open');$('cardPanel').removeAttribute('role');$('cardPanel').removeAttribute('aria-modal');$('cardBackdrop').classList.add('hidden');$('mobileCardBtn').setAttribute('aria-expanded','false');updateOverlay();if(wasOpen&&cardReturn?.isConnected&&cardReturn.offsetParent!==null)cardReturn.focus({preventScroll:true})}
 function closeModal(){$('modalBackdrop').classList.add('hidden');pending=null;updateOverlay();if(overlayReturn?.isConnected&&overlayReturn.offsetParent!==null)overlayReturn.focus({preventScroll:true})}
 function updateSaveStatus(){if(!user)return;$('saveStatus').textContent=`${user.name} · ${saveFailed?'待重新保存':pendingProgress.size?'正在保存':'已同步'}`;$('saveStatus').classList.toggle('save-error',saveFailed);$('syncNotice').classList.toggle('hidden',!saveFailed)}
-function queueProgress(body){const path=`/api/attempts/${attempt.id}/progress`,key=`${attempt.id}:${body.questionId}`;pendingProgress.set(key,{path,body});updateSaveStatus();flushProgress().catch(()=>{})}
+function enqueuePosition(position){
+ const key=`${attempt.id}:position`;
+ // Always keep the newest position behind answer writes. Replacing a Map entry
+ // alone would preserve its old order and could persist a stale position last.
+ pendingProgress.delete(key);
+ pendingProgress.set(key,{path:`/api/attempts/${attempt.id}/position`,body:{position}});
+}
+function queueProgress(body){
+ const {position,...answerBody}=body;
+ const path=`/api/attempts/${attempt.id}/progress`,key=`${attempt.id}:${body.questionId}`;
+ pendingProgress.set(key,{path,body:answerBody});
+ enqueuePosition(position??attempt.position);
+ updateSaveStatus();flushProgress().catch(()=>{});
+}
+function queuePosition(position){enqueuePosition(position);updateSaveStatus();flushProgress().catch(()=>{})}
 async function flushProgress(){
   if(saveTask)return saveTask;
   if(!pendingProgress.size)return;
@@ -112,7 +126,14 @@ const current=()=>attempt.questions[attempt.position];
 function renderQuiz(){if(!attempt)return renderHome();if(attempt.submittedAt)return renderResult();const q=current();show('quiz');closeCard();const key=attempt.id+':'+q.id;if(renderedQuestionKey!==key){$('questionScroll').scrollTop=0;renderedQuestionKey=key}$('modeBadge').textContent=attempt.mode==='exam'?'考试模式':'练习模式';$('quizTitle').textContent=attempt.title;$('quizTitle').title=attempt.title;$('quizProgress').textContent=`${attempt.position+1} / ${attempt.questions.length}`;$('questionType').textContent=q.type+'题';$('questionNumber').textContent=`第 ${attempt.position+1} 题`;$('questionNumber').title=`原题号 ${q.number}`;$('questionChapter').textContent=q.chapter;$('questionStem').textContent=q.stem;$('answerHint').textContent=q.type==='多选'?'请选择所有正确答案，全部选对才算正确。':'请选择一个答案。';const favorite=!!learning.items[q.id]?.favorite;buttonLabel('favoriteBtn','star',favorite?'已收藏':'收藏');$('favoriteBtn').classList.toggle('active',favorite);buttonLabel('markBtn','flag',attempt.marks[q.id]?'已标记':'标记');$('markBtn').classList.toggle('active',!!attempt.marks[q.id]);const chosen=attempt.answers[q.id]||'',confirmed=!!attempt.confirmed[q.id];renderSelectionStatus();$('options').innerHTML=Object.entries(q.options).map(([letter,label])=>`<button type="button" class="option ${chosen.includes(letter)?'selected':''} ${confirmed&&q.answer?.includes(letter)?'correct':''} ${confirmed&&chosen.includes(letter)&&!q.answer?.includes(letter)?'incorrect':''}" data-letter="${letter}" aria-pressed="${chosen.includes(letter)}" ${confirmed?'disabled':''}><span class="letter">${letter}</span><span>${escapeHtml(label)}</span></button>`).join('');$('options').querySelectorAll('button').forEach(button=>button.onclick=()=>choose(button.dataset.letter));$('feedback').classList.toggle('hidden',!confirmed);if(confirmed){$('feedback').classList.toggle('wrong',chosen!==q.answer);$('feedback').innerHTML=`<strong>${chosen===q.answer?'回答正确':'回答错误'} · 正确答案 ${escapeHtml(q.answer)}</strong>${escapeHtml(q.explanation||'原题未提供解析。')}`}$('confirmBtn').classList.toggle('hidden',attempt.mode==='exam'||confirmed);$('confirmBtn').disabled=!chosen;$('prevBtn').disabled=attempt.position===0;buttonLabel('nextBtn',attempt.position===attempt.questions.length-1?'grid':'arrow-right',attempt.position===attempt.questions.length-1?'查看答题卡':'下一题',true);renderCard();updateQuizControls()}
 async function choose(letter){const q=current();if(quizBusy||attempt.confirmed[q.id]||!Object.hasOwn(q.options,letter))return;const previous=attempt.answers[q.id]||'',answer=q.type==='多选'?normalizeAnswer(previous.includes(letter)?previous.replace(letter,''):previous+letter):letter;attempt.answers[q.id]=answer;$('options').querySelectorAll('.option').forEach(button=>{const active=answer.includes(button.dataset.letter);button.classList.toggle('selected',active);button.setAttribute('aria-pressed',String(active))});$('confirmBtn').disabled=!answer;renderSelectionStatus();renderCard();queueProgress({questionId:q.id,answer,position:attempt.position,marked:!!attempt.marks[q.id]})}
 async function confirmQuestion(){return quizAction(async()=>{await flushProgress();const q=current();if(!attempt.answers[q.id])return;const result=await api(`/api/attempts/${attempt.id}/confirm`,'POST',{questionId:q.id});attempt.confirmed[q.id]=true;attempt.questions[attempt.position]={...q,answer:result.answer,explanation:result.explanation};await refreshLearning();renderQuiz()})}
-async function moveTo(index){return quizAction(async()=>{await flushProgress();const position=Math.max(0,Math.min(attempt.questions.length-1,index));await api(`/api/attempts/${attempt.id}/position`,'PATCH',{position});attempt.position=position;renderQuiz();requestAnimationFrame(()=>window.scrollTo({top:Math.max(0,$('quizView').offsetTop-10),behavior:'auto'}))})}
+function moveTo(index){
+ if(!attempt||attempt.submittedAt||quizBusy||!Number.isInteger(index))return;
+ const position=Math.max(0,Math.min(attempt.questions.length-1,index));
+ attempt.position=position;
+ renderQuiz();
+ queuePosition(position);
+ requestAnimationFrame(()=>{if(view==='quiz'&&!matchMedia('(max-width:850px)').matches)window.scrollTo({top:Math.max(0,$('quizView').offsetTop-10),behavior:'auto'})});
+}
 function renderSelectionStatus(){const q=current(),answer=attempt.answers[q.id]||'';$('selectionStatus').textContent=answer?`已选择 ${[...answer].join('、')}${attempt.confirmed[q.id]?' · 已确认':attempt.mode==='practice'?' · 确认后查看解析':''}`:'尚未选择答案'}
 function renderCard(){
   const n=attempt.questions.filter(q=>attempt.answers[q.id]).length,m=attempt.questions.filter(q=>attempt.marks[q.id]).length;
